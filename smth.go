@@ -15,13 +15,12 @@ func main() {
 
 	panicWhenReadError(err)
 
-	reader := bytes.NewReader(content)
-
-	value := readAll(reader)
+	value := Bdecode(content)
 	fmt.Println(value)
 }
 
-func readAll(reader *bytes.Reader) interface{} {
+func Bdecode(data []byte) interface{} {
+	reader := bytes.NewReader(data)
 	var topLevelList []interface{}
 
 	for {
@@ -40,6 +39,60 @@ func readAll(reader *bytes.Reader) interface{} {
 			topLevelList = append(topLevelList, value)
 		}
 	}
+}
+
+func Bencode(data interface{}) []byte {
+	buffer := bytes.NewBuffer([]byte{})
+
+	writeGeneric(data, buffer)
+
+	return buffer.Bytes()
+}
+
+func writeGeneric(data interface{}, buffer *bytes.Buffer) {
+	switch cast := data.(type) {
+	case string:
+		writeString(cast, buffer)
+	case int:
+		writeInt(cast, buffer)
+	case []interface{}:
+		writeList(cast, buffer)
+	case map[string]interface{}:
+		writeDict(cast, buffer)
+	}
+}
+
+func writeDict(dict map[string]interface{}, buffer *bytes.Buffer) {
+	buffer.WriteString("d")
+
+	for k, v := range dict {
+		writeString(k, buffer)
+		writeGeneric(v, buffer)
+	}
+
+	buffer.WriteString("e")
+}
+
+func writeList(list []interface{}, buffer *bytes.Buffer) {
+	buffer.WriteString("l")
+
+	for _, v := range list {
+		writeGeneric(v, buffer)
+	}
+
+	buffer.WriteString("e")
+}
+
+func writeInt(number int, buffer *bytes.Buffer) {
+	buffer.WriteString("i")
+	buffer.WriteString(strconv.Itoa(number))
+	buffer.WriteString("e")
+}
+
+func writeString(str string, buffer *bytes.Buffer) {
+	buffer.WriteString(strconv.Itoa(len(str)))
+	buffer.WriteString(":")
+	buffer.WriteString(str)
 }
 
 func readGeneric(reader *bytes.Reader) interface{} {
