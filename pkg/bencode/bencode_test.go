@@ -1,4 +1,4 @@
-package main
+package bencode
 
 import (
 	"reflect"
@@ -8,7 +8,7 @@ import (
 const exampleBencodedString = "l5:helloi-42ed3:key5:valuee2:\u0001\u0002e"
 
 func TestReadBencode(t *testing.T) {
-	result := Bdecode([]byte(exampleBencodedString))
+	result := Decode([]byte(exampleBencodedString))
 
 	topmostList, successCast := result.([]interface{})
 
@@ -42,7 +42,7 @@ func TestReadBencode(t *testing.T) {
 }
 
 func TestWriteBencode(t *testing.T) {
-	binaryResult := Bencode(Bdecode([]byte(exampleBencodedString)))
+	binaryResult := Encode(Decode([]byte(exampleBencodedString)))
 
 	if string(binaryResult) != exampleBencodedString {
 		t.Fatal("Cannot encode the same way")

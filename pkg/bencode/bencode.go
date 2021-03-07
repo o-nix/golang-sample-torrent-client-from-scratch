@@ -1,25 +1,13 @@
-package main
+package bencode
 
 import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
 	"strconv"
 )
 
-func main() {
-	var filePath = "golang-for-professionals.torrent"
-
-	content, err := os.ReadFile(filePath)
-
-	panicWhenReadError(err)
-
-	value := Bdecode(content)
-	fmt.Println(value)
-}
-
-func Bdecode(data []byte) interface{} {
+func Decode(data []byte) interface{} {
 	reader := bytes.NewReader(data)
 	var topLevelList []interface{}
 
@@ -41,7 +29,7 @@ func Bdecode(data []byte) interface{} {
 	}
 }
 
-func Bencode(data interface{}) []byte {
+func Encode(data interface{}) []byte {
 	buffer := bytes.NewBuffer([]byte{})
 
 	writeGeneric(data, buffer)
@@ -141,7 +129,7 @@ func readString(reader *bytes.Reader) string {
 func panicWhenReadError(err error) {
 	switch {
 	case err == io.EOF:
-		panic("Torrent file is corrupted")
+		panic("data is corrupted")
 	case err != nil:
 		panic(fmt.Errorf("unknown read error: %w", err))
 	}
@@ -165,14 +153,14 @@ loop:
 		case isDigit(curr):
 			digits = append(digits, curr)
 		default:
-			panic("Cannot read integer: premature end of data")
+			panic("cannot read integer: premature end of data")
 		}
 	}
 
 	numberOfNextBytes, err := strconv.Atoi(string(digits))
 
 	if err != nil {
-		panic("Cannot convert binary string length to value")
+		panic("cannot convert binary string length to value")
 	}
 
 	return numberOfNextBytes * sign
@@ -212,7 +200,7 @@ func isStructEnd(reader *bytes.Reader) bool {
 	readByte, err := reader.ReadByte()
 
 	if err != nil {
-		panic("Error detecting end of structure (invalid bencode data?)")
+		panic("error detecting end of structure (invalid bencode data?)")
 	}
 
 	if readByte == 'e' {
