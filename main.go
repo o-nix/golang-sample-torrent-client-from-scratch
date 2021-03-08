@@ -8,6 +8,7 @@ import (
 	"github.com/dchest/uniuri"
 	"github.com/o-nix/golang-sample-torrent-client-from-scratch/pkg/bencode"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -15,7 +16,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
+
+var httpClient http.Client
+
+func init() {
+	httpClient = http.Client{
+		Timeout: time.Second * 30,
+	}
+
+	rand.Seed(time.Now().UnixNano())
+}
 
 func main() {
 	var filePath = "golang-for-prof.torrent"
@@ -39,15 +51,20 @@ func main() {
 		},
 	}
 
-	go client.run()
+	localConnInfo := LocalConnectionInfo{
+		port: 16000 + rand.Intn(32000),
+	}
+
+	go client.run(localConnInfo)
 
 	select {} // Wait forever
 }
 
 type TrackerTransport struct {
-	peerID    string
-	trackerID string
-	interval  int
+	peerID     string
+	trackerID  string
+	requestNum int
+	interval   int
 }
 
 type Peer struct {
@@ -79,7 +96,7 @@ type TorrentClient struct {
 	stats            UpDownStats
 }
 
-func (tc *TorrentClient) run() {
+func (tc *TorrentClient) run(localConnInfo LocalConnectionInfo) {
 	trackerUrl := tc.metadata.announces[0]
 	infoHash := tc.metadata.infoHash
 	left := 0
@@ -94,22 +111,46 @@ func (tc *TorrentClient) run() {
 		left:       left,
 	}
 
-	tc.trackerTransport.announceStart(trackerUrl, infoHash, stats)
-}
-
-func (tt *TrackerTransport) announceStart(trackerUrl string, infoHash []byte, stats UpDownStats) {
 	parsedUrl, err := url.Parse(trackerUrl)
 
 	if err != nil {
 		panic(fmt.Errorf("cannot parse URL: %v", err))
 	}
 
-	query := parsedUrl.Query()
+	ips, err := tc.trackerTransport.announce(*parsedUrl, "started", localConnInfo, infoHash, stats)
+
+	if err != nil {
+		panic(err)
+	}
+
+	print(ips)
+
+	_, _ = tc.trackerTransport.announce(*parsedUrl, "stopped", localConnInfo, infoHash, stats)
+}
+
+type LocalConnectionInfo struct {
+	port int
+	ip   net.IP
+}
+
+func (tt *TrackerTransport) announce(trackerUrl url.URL, event string, localConnInfo LocalConnectionInfo, infoHash []byte, stats UpDownStats) (ips []string, err error) {
+	query := trackerUrl.Query()
 
 	query.Set("peer_id", tt.peerID)
 	query.Set("info_hash", string(infoHash))
-	query.Set("port", "6881")
-	query.Set("event", "started")
+	query.Set("port", strconv.Itoa(localConnInfo.port))
+
+	if localConnInfo.ip != nil {
+		query.Set("ip", localConnInfo.ip.String())
+	}
+
+	if event != "" {
+		query.Set("event", event)
+	}
+
+	if tt.requestNum == 0 {
+		query.Set("event", "started")
+	}
 
 	query.Set("downloaded", strconv.Itoa(stats.downloaded))
 	query.Set("uploaded", strconv.Itoa(stats.uploaded))
@@ -121,12 +162,14 @@ func (tt *TrackerTransport) announceStart(trackerUrl string, infoHash []byte, st
 		query.Set("trackerid", tt.trackerID)
 	}
 
-	parsedUrl.RawQuery = query.Encode()
+	trackerUrl.RawQuery = query.Encode()
 
-	resp, err := http.Get(parsedUrl.String())
+	resp, err := httpClient.Get(trackerUrl.String())
 
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("can't reach %v: %v", trackerUrl, err)
+	} else {
+		tt.requestNum++
 	}
 
 	defer func() {
@@ -149,7 +192,8 @@ func (tt *TrackerTransport) announceStart(trackerUrl string, infoHash []byte, st
 	}
 
 	allIps := decodeIPs(trackerResponse["peers"].(string))
-	print(allIps)
+
+	return allIps, nil
 }
 
 func decodeIPs(IPsString string) []string {
