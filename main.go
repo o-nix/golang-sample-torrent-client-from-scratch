@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 func main() {
@@ -45,6 +47,7 @@ func main() {
 type TrackerTransport struct {
 	peerID    string
 	trackerID string
+	interval  int
 }
 
 type Peer struct {
@@ -63,6 +66,8 @@ type TorrentMetadata struct {
 	announces []string
 	infoHash  []byte
 	files     []FileInfo
+	raw       map[string]interface{}
+	folder    string
 }
 
 type TorrentClient struct {
@@ -77,11 +82,16 @@ type TorrentClient struct {
 func (tc *TorrentClient) run() {
 	trackerUrl := tc.metadata.announces[0]
 	infoHash := tc.metadata.infoHash
+	left := 0
+
+	for _, file := range tc.metadata.files {
+		left += file.size
+	}
 
 	stats := UpDownStats{
 		downloaded: 0,
 		uploaded:   0,
-		left:       tc.metadata.files[0].size,
+		left:       left,
 	}
 
 	tc.trackerTransport.announceStart(trackerUrl, infoHash, stats)
@@ -132,6 +142,7 @@ func (tt *TrackerTransport) announceStart(trackerUrl string, infoHash []byte, st
 	trackerResponse := bencode.Decode(bodyBytes).(map[string]interface{})
 
 	trackerID := trackerResponse["tracker id"]
+	tt.interval = trackerResponse["interval"].(int)
 
 	if trackerID != nil {
 		tt.trackerID = trackerID.(string)
@@ -143,8 +154,8 @@ func (tt *TrackerTransport) announceStart(trackerUrl string, infoHash []byte, st
 
 func decodeIPs(IPsString string) []string {
 	reader := bytes.NewReader([]byte(IPsString))
-	chunk := make([]byte, 6)
-	var addrs []string
+	chunk := make([]byte, 6, 6)
+	addrs := make([]string, 0, reader.Size()/6)
 
 	for {
 		numRead, err := reader.Read(chunk)
@@ -164,6 +175,7 @@ func decodeIPs(IPsString string) []string {
 }
 
 type FileInfo struct {
+	path string
 	size int
 }
 
@@ -189,13 +201,42 @@ func createTorrentInfo(untyped interface{}) TorrentMetadata {
 	info := dict["info"].(map[string]interface{})
 	infoHash := sha1.Sum(bencode.Encode(info))
 
+	var files []FileInfo
+	topLevelName := info["name"].(string)
+
+	if fileEntries := info["files"]; fileEntries != nil {
+		for _, fileEntry := range fileEntries.([]map[string]interface{}) {
+			var builder strings.Builder
+
+			for _, pathComponent := range fileEntry["path"].([]string) {
+				if builder.Len() > 0 {
+					builder.WriteRune(filepath.Separator)
+				}
+
+				builder.WriteString(pathComponent)
+			}
+
+			files = append(files, FileInfo{
+				size: fileEntry["length"].(int),
+				path: builder.String(),
+			})
+		}
+	} else {
+		files = []FileInfo{
+			{
+				path: topLevelName,
+				size: info["length"].(int),
+			},
+		}
+
+		topLevelName = ""
+	}
+
 	return TorrentMetadata{
 		announces: announces,
 		infoHash:  infoHash[:],
-		files: []FileInfo{
-			{
-				size: info["length"].(int),
-			},
-		},
+		folder:    topLevelName,
+		files:     files,
+		raw:       dict,
 	}
 }
