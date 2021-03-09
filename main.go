@@ -31,7 +31,7 @@ func init() {
 }
 
 func main() {
-	var filePath = "golang-for-prof.torrent"
+	var filePath = "test.torrent"
 
 	content, err := os.ReadFile(filePath)
 
@@ -41,7 +41,7 @@ func main() {
 
 	metadata := createTorrentInfo(bencode.Decode(content))
 
-	// Generate new ID for the whole app: https://wiki.theory.org/BitTorrentSpecification#peer_id
+	// Generate new peer ID: https://wiki.theory.org/BitTorrentSpecification#peer_id
 	peerID := "-DF0001-" + uniuri.NewLen(12)
 
 	localConnInfo := LocalConnectionInfo{
@@ -72,7 +72,11 @@ func main() {
 
 	go client.run()
 
-	select {} // Wait forever
+	http.HandleFunc("/announce", func(writer http.ResponseWriter, request *http.Request) {
+		print(request)
+	})
+
+	log.Fatal(http.ListenAndServe(":26880", nil))
 }
 
 type TrackerTransport struct {
@@ -255,8 +259,11 @@ type FileInfo struct {
 
 func createTorrentInfo(untyped interface{}) TorrentMetadata {
 	dict := untyped.(map[string]interface{})
+	var annListValue []interface{}
 
-	annListValue := dict["announce-list"].([]interface{})
+	if annListUntyped := dict["announce-list"]; annListUntyped != nil {
+		annListValue = annListUntyped.([]interface{})
+	}
 	announces := []string{dict["announce"].(string)}
 
 	for _, listWithElemsValue := range annListValue {
@@ -279,15 +286,16 @@ func createTorrentInfo(untyped interface{}) TorrentMetadata {
 	topLevelName := info["name"].(string)
 
 	if fileEntries := info["files"]; fileEntries != nil {
-		for _, fileEntry := range fileEntries.([]map[string]interface{}) {
+		for _, fileEntryUntyped := range fileEntries.([]interface{}) {
 			var builder strings.Builder
+			fileEntry := fileEntryUntyped.(map[string]interface{})
 
-			for _, pathComponent := range fileEntry["path"].([]string) {
+			for _, pathComponent := range fileEntry["path"].([]interface{}) {
 				if builder.Len() > 0 {
 					builder.WriteRune(filepath.Separator)
 				}
 
-				builder.WriteString(pathComponent)
+				builder.WriteString(pathComponent.(string))
 			}
 
 			files = append(files, FileInfo{
