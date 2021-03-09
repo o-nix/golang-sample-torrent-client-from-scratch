@@ -14,9 +14,9 @@ func Test_decodeIPs(t *testing.T) {
 	testBytes = append(testBytes, []byte(ip.To4())...)
 	testBytes = append(testBytes, portBytes...)
 
-	res := decodeIPs(string(testBytes))
+	res := decodePeers(string(testBytes))
 
-	if len(res) != 1 && res[0] != "172.1.2.3:16378" {
+	if r := res[0]; len(res) != 1 || r.ip.String() != "172.1.2.3" || r.port != 16378 {
 		t.Fail()
 	}
 }
