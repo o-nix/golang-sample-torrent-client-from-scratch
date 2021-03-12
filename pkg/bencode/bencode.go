@@ -2,8 +2,10 @@ package bencode
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strconv"
 )
 
@@ -47,6 +49,18 @@ func writeGeneric(data interface{}, buffer *bytes.Buffer) {
 		writeList(cast, buffer)
 	case map[string]interface{}:
 		writeDict(cast, buffer)
+	default:
+		switch kind := reflect.ValueOf(data).Kind(); kind {
+		case reflect.Struct:
+			jsoned, _ := json.Marshal(data)
+
+			cast := make(map[string]interface{})
+			_ = json.Unmarshal(jsoned, &cast)
+
+			writeDict(cast, buffer)
+		default:
+			panic(fmt.Sprintf("Unsupported type for bencode %s", kind))
+		}
 	}
 }
 
