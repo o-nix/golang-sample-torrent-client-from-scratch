@@ -25,7 +25,10 @@ func main() {
 
 		hash, _ := url.QueryUnescape(query.Get("info_hash"))
 
-		host, _, _ := net.SplitHostPort(request.RemoteAddr)
+		addr := request.RemoteAddr
+		log.Printf("New /announce request from %s with params: %v", addr, query)
+
+		host, _, _ := net.SplitHostPort(addr)
 		ip := net.ParseIP(host)
 
 		if ip.Equal(net.IPv6loopback) {
@@ -70,6 +73,8 @@ func main() {
 	})
 
 	http.HandleFunc("/scrape", func(writer http.ResponseWriter, request *http.Request) {
+		log.Printf("New /scrape request from %s with params: %v", request.RemoteAddr, request.URL.Query())
+
 		out := make(map[string]interface{})
 		files := make(map[string]interface{})
 		out["files"] = files

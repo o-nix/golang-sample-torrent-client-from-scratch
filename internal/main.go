@@ -94,6 +94,10 @@ type Peer struct {
 	Port int
 }
 
+func (p *Peer) String() string {
+	return fmt.Sprintf("[%s %s:%d]", p.Id, p.Ip.String(), p.Port)
+}
+
 func (p *Peer) ToBytes() []byte {
 	result := make([]byte, 6)
 	binary.BigEndian.PutUint16(result[4:], uint16(p.Port))
@@ -123,6 +127,7 @@ type TorrentClient struct {
 	trackerId string
 	peers     []Peer
 	stats     UpDownStats
+	conns     []WireProtocolConnection
 }
 
 func (tc *TorrentClient) run() {
@@ -150,12 +155,160 @@ func (tc *TorrentClient) run() {
 		}
 	}
 
-	time.Sleep(time.Second * 2)
+	for _, peer := range tc.peers {
+		conn := WireProtocolConnection{
+			peer:      peer,
+			active:    true,
+			hash:      tc.metadata.infoHash,
+			ownId:     tc.peerID,
+			pieceSize: tc.metadata.raw["info"].(map[string]interface{})["piece length"].(int),
+		}
+
+		tc.conns = append(tc.conns, conn)
+		go conn.start()
+	}
+
+	time.Sleep(time.Hour * 2)
 
 	for _, tracker := range tc.trackers {
 		if tracker.active {
 			_, _ = tracker.announce(TrackerStoppedEvent, infoHash, stats)
 		}
+	}
+}
+
+type WireProtocolConnection struct {
+	peer      Peer
+	active    bool
+	hash      []byte
+	ownId     string
+	pieceSize int
+	conn      net.Conn
+}
+
+const (
+	choke         = iota
+	unchoke       = iota
+	interested    = iota
+	notInterested = iota
+	have          = iota
+	bitfield      = iota
+	request       = iota
+)
+
+func (c *WireProtocolConnection) start() {
+	host := net.JoinHostPort(c.peer.Ip.String(), strconv.Itoa(c.peer.Port))
+	conn, err := net.Dial("tcp", host)
+
+	if err != nil {
+		c.active = false
+
+		log.Printf("Cannot initiate connect to %s\n", host)
+
+		// time.AfterFunc(time.Second * 30, func() {
+		//	c.start()
+		// })
+
+		return
+	}
+
+	c.conn = conn
+
+	// <pstrlen><pstr><reserved><info_hash><peer_id>
+
+	const ptsr = "BitTorrent protocol"
+	zeroes := make([]byte, 8)
+
+	buf := bytes.NewBuffer(make([]byte, 0, 68))
+	_ = binary.Write(buf, binary.BigEndian, int8(len(ptsr)))
+	buf.WriteString(ptsr)
+	buf.Write(zeroes)
+	buf.Write(c.hash)
+	buf.Write([]byte(c.ownId))
+
+	log.Printf("Sending handshake to %s...", host)
+
+	_, err = conn.Write(buf.Bytes())
+
+	if err != nil {
+		log.Println("Unable to connect and send handshake")
+		c.conn = nil
+
+		return
+	}
+
+	go func() {
+		readBuf := make([]byte, 1, 1)
+		msgBuf := bytes.NewBuffer([]byte{})
+		var numWantMore uint32
+		shaked := false
+		handshake := make([]byte, 68, 68)
+
+		for {
+			numRead, err := conn.Read(readBuf)
+
+			if err != nil {
+				log.Printf("Disconnected from %s:%d\n", c.peer.Ip.String(), c.peer.Port)
+				return
+			}
+
+			reader := bytes.NewReader(readBuf[:numRead])
+			_, _ = msgBuf.ReadFrom(reader)
+
+			if msgBuf.Len() < 4 || !shaked && msgBuf.Len() < 68 { // Fewer than "message size" bytes
+				continue
+			}
+
+			if !shaked {
+				_, _ = msgBuf.Read(handshake)
+				shaked = true
+			}
+
+			c.peer.Id = string(handshake[48:])
+
+			for {
+				if l := msgBuf.Len(); l < 4 { // Data with at least the msg size not yet arrived
+					if l > 1024 {
+						msgBuf.Truncate(1024)
+					}
+
+					break
+				}
+
+				if numWantMore == 0 { // Read first 4 bytes containing msg size
+					_ = binary.Read(msgBuf, binary.BigEndian, &numWantMore)
+				}
+
+				if numWantMore < uint32(msgBuf.Len()) { // Message is still incomplete, wait for new network bytes
+					break
+				}
+
+				msgType, _ := msgBuf.ReadByte() // 5th bytes is the msg type
+				numWantMore--                   // Type byte is included in the size
+				payload := make([]byte, numWantMore)
+
+				_, _ = msgBuf.Read(payload)
+				numWantMore = 0
+
+				log.Printf("New message %d received from %s\n", msgType, c.peer.String())
+			}
+		}
+	}()
+
+	keepAliveMsg := [4]byte{}
+
+	for {
+		log.Printf("Writing keep-alive to %s", c.peer.String())
+		_, err := conn.Write(keepAliveMsg[:])
+
+		if err != nil {
+			log.Println("Cannot write keep-alive, disconnecting...")
+			_ = conn.Close()
+
+			return
+		}
+
+		time.Sleep(time.Second * 1)
 	}
 }
 
@@ -288,7 +441,8 @@ func createTorrentInfo(untyped interface{}) TorrentMetadata {
 	}
 
 	info := dict["info"].(map[string]interface{})
-	infoHash := sha1.Sum(bencode.Encode(info))
+	encoded := bencode.Encode(info)
+	infoHash := sha1.Sum(encoded)
 
 	var files []FileInfo
 	topLevelName := info["name"].(string)

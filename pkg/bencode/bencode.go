@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strconv"
 )
 
@@ -51,6 +52,8 @@ func writeGeneric(data interface{}, buffer *bytes.Buffer) {
 		writeDict(cast, buffer)
 	default:
 		switch kind := reflect.ValueOf(data).Kind(); kind {
+		case reflect.Map:
+			writeDictReflected(data, buffer)
 		case reflect.Struct:
 			jsoned, _ := json.Marshal(data)
 
@@ -67,9 +70,32 @@ func writeGeneric(data interface{}, buffer *bytes.Buffer) {
 func writeDict(dict map[string]interface{}, buffer *bytes.Buffer) {
 	buffer.WriteString("d")
 
-	for k, v := range dict {
+	keys := make([]string, 0)
+
+	for k, _ := range dict {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		v := dict[k]
+
 		writeString(k, buffer)
 		writeGeneric(v, buffer)
+	}
+
+	buffer.WriteString("e")
+}
+
+func writeDictReflected(dictLike interface{}, buffer *bytes.Buffer) {
+	buffer.WriteString("d")
+
+	r := reflect.ValueOf(dictLike).MapRange()
+
+	for r.Next() {
+		writeString(r.Key().String(), buffer)
+		writeGeneric(r.Value().Interface(), buffer)
 	}
 
 	buffer.WriteString("e")

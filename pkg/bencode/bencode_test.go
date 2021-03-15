@@ -42,9 +42,24 @@ func TestReadBencode(t *testing.T) {
 }
 
 func TestWriteBencode(t *testing.T) {
+	type Multimap map[string]map[string]string
+
 	binaryResult := Encode(Decode([]byte(exampleBencodedString)))
 
 	if string(binaryResult) != exampleBencodedString {
 		t.Fatal("Cannot encode the same way")
+	}
+
+	multimap := make(Multimap)
+	multimap["first-level"] = map[string]string{
+		"second-level": "value",
+	}
+
+	generic := Decode(Encode(multimap))
+	first := generic.(map[string]interface{})["first-level"]
+	second := first.(map[string]interface{})
+
+	if second["second-level"] != "value" {
+		t.Fail()
 	}
 }
