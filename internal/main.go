@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-	"github.com/dchest/uniuri"
 	"github.com/o-nix/golang-sample-torrent-client-from-scratch/pkg/bencode"
 	"io"
 	"log"
@@ -46,15 +46,17 @@ func Start(filePath string) {
 	metadata := createTorrentInfo(bencode.Decode(content))
 
 	// Generate new peer ID: https://wiki.theory.org/BitTorrentSpecification#peer_id
-	peerID := "-DF0001-" + uniuri.NewLen(12)
+	// peerID := "-DF0001-" + uniuri.NewLen(12)
+	peerID := "-DE13F0-8ioIzjScYpP7"
 
 	localConnInfo := LocalConnectionInfo{
-		port:   16000 + rand.Intn(32000),
+		port:   25276, // 16000 + rand.Intn(32000),
 		peerID: peerID,
 	}
 
 	client := TorrentClient{
 		metadata: metadata,
+		peerID:   peerID,
 	}
 
 	for _, announceUrl := range metadata.announceUrls {
@@ -118,6 +120,7 @@ type TorrentMetadata struct {
 	files        []FileInfo
 	raw          map[string]interface{}
 	folder       string
+	pieceLen     int
 }
 
 type TorrentClient struct {
@@ -159,9 +162,14 @@ func (tc *TorrentClient) run() {
 		conn := WireProtocolConnection{
 			peer:      peer,
 			active:    true,
-			hash:      tc.metadata.infoHash,
+			infoHash:  tc.metadata.infoHash,
 			ownId:     tc.peerID,
-			pieceSize: tc.metadata.raw["info"].(map[string]interface{})["piece length"].(int),
+			pieceSize: tc.metadata.pieceLen,
+
+			iamChoked:       true,
+			iamInteresting:  false,
+			peerChoked:      true,
+			peerInteresting: false,
 		}
 
 		tc.conns = append(tc.conns, conn)
@@ -180,10 +188,15 @@ func (tc *TorrentClient) run() {
 type WireProtocolConnection struct {
 	peer      Peer
 	active    bool
-	hash      []byte
+	infoHash  []byte
 	ownId     string
 	pieceSize int
 	conn      net.Conn
+
+	iamChoked       bool // Default: true
+	iamInteresting  bool // Default: false
+	peerChoked      bool // Default: true
+	peerInteresting bool // Default: false
 }
 
 const (
@@ -196,42 +209,41 @@ const (
 	request       = iota
 )
 
+const protocolVersionConstant = "BitTorrent protocol"
+
+var keepAliveMsg = [4]byte{}
+
+var unchokeMsg = createMsg(unchoke, 1)
+var interestedMsg = createMsg(interested, 1)
+
+func createMsg(msg byte, len uint32) []byte {
+	var buf = bytes.NewBuffer(nil)
+
+	_ = binary.Write(buf, binary.BigEndian, len)
+	_ = binary.Write(buf, binary.BigEndian, msg)
+
+	return buf.Bytes()
+}
+
 func (c *WireProtocolConnection) start() {
-	host := net.JoinHostPort(c.peer.Ip.String(), strconv.Itoa(c.peer.Port))
+	peer := c.peer
+	host := net.JoinHostPort(peer.Ip.String(), strconv.Itoa(peer.Port))
 	conn, err := net.Dial("tcp", host)
 
 	if err != nil {
 		c.active = false
-
-		log.Printf("Cannot initiate connect to %s\n", host)
-
-		// time.AfterFunc(time.Second * 30, func() {
-		//	c.start()
-		// })
+		log.Println("Cannot initiate connect to", peer)
 
 		return
 	}
 
 	c.conn = conn
 
-	// <pstrlen><pstr><reserved><info_hash><peer_id>
-
-	const ptsr = "BitTorrent protocol"
-	zeroes := make([]byte, 8)
-
-	buf := bytes.NewBuffer(make([]byte, 0, 68))
-	_ = binary.Write(buf, binary.BigEndian, int8(len(ptsr)))
-	buf.WriteString(ptsr)
-	buf.Write(zeroes)
-	buf.Write(c.hash)
-	buf.Write([]byte(c.ownId))
-
-	log.Printf("Sending handshake to %s...", host)
-
-	_, err = conn.Write(buf.Bytes())
+	log.Println("Sending handshake to", peer)
+	_, err = conn.Write(c.generateHandshakeMsg())
 
 	if err != nil {
-		log.Println("Unable to connect and send handshake")
+		log.Println("Unable to connect and send handshake to", peer)
 		c.conn = nil
 
 		return
@@ -239,7 +251,7 @@ func (c *WireProtocolConnection) start() {
 
 	go func() {
 		readBuf := make([]byte, 1, 1)
-		msgBuf := bytes.NewBuffer([]byte{})
+		msgBuf := bytes.NewBuffer(nil)
 		var numWantMore uint32
 		shaked := false
 		handshake := make([]byte, 68, 68)
@@ -248,38 +260,50 @@ func (c *WireProtocolConnection) start() {
 			numRead, err := conn.Read(readBuf)
 
 			if err != nil {
-				log.Printf("Disconnected from %s:%d\n", c.peer.Ip.String(), c.peer.Port)
+				log.Println("Disconnected from", peer)
 				return
 			}
 
 			reader := bytes.NewReader(readBuf[:numRead])
 			_, _ = msgBuf.ReadFrom(reader)
 
-			if msgBuf.Len() < 4 || !shaked && msgBuf.Len() < 68 { // Fewer than "message size" bytes
+			if !shaked && msgBuf.Len() < 68 { // Fewer than "message size" bytes
 				continue
 			}
 
 			if !shaked {
 				_, _ = msgBuf.Read(handshake)
 				shaked = true
-			}
 
-			c.peer.Id = string(handshake[48:])
+				peerInfoHash := handshake[28:48]
 
-			for {
-				if l := msgBuf.Len(); l < 4 { // Data with at least the msg size not yet arrived
-					if l > 1024 {
-						msgBuf.Truncate(1024)
-					}
+				if !bytes.Equal(peerInfoHash, c.infoHash) {
+					log.Printf("Peer returned info_hash %s we are not interested in, disconnecting...\n", hex.EncodeToString(peerInfoHash))
 
-					break
+					_ = conn.Close()
+
+					return
 				}
 
+				peer.Id = string(handshake[48:])
+
+				log.Println("Got handshake from", peer)
+			}
+
+			for {
 				if numWantMore == 0 { // Read first 4 bytes containing msg size
+					if msgBuf.Len() < 4 {
+						break
+					}
+
 					_ = binary.Read(msgBuf, binary.BigEndian, &numWantMore)
 				}
 
-				if numWantMore < uint32(msgBuf.Len()) { // Message is still incomplete, wait for new network bytes
+				if uint32(msgBuf.Len()) < numWantMore { // Message is still incomplete, wait for new network bytes
+					if msgBuf.Cap() > 32*1024 {
+						msgBuf.Truncate(1024) // Do we need this?
+					}
+
 					break
 				}
 
@@ -290,26 +314,58 @@ func (c *WireProtocolConnection) start() {
 				_, _ = msgBuf.Read(payload)
 				numWantMore = 0
 
-				log.Printf("New message %d received from %s\n", msgType, c.peer.String())
+				log.Printf("New message %d received from %s\n", msgType, peer.String())
 			}
 		}
 	}()
 
-	keepAliveMsg := [4]byte{}
+	time.Sleep(time.Second * 2)
+
+	log.Printf("Sending initial keep-alive to %s\n", peer.String())
+	_, err = conn.Write(keepAliveMsg[:])
+
+	// time.Sleep(time.Second * 2)
+
+	// log.Println("Sending initial INTERESTED to", peer)
+	// _, err = conn.Write(interestedMsg[:])
+
+	// request := createMsg(request, 13)
+	// zero := [4]byte{0}
+	// tt := [4]byte{0, 0, 0, 255}
+	// request = append(request, zero[:]...)
+	// request = append(request, zero[:]...)
+	// request = append(request, tt[:]...)
+	//
+	// _, err = conn.Write(request)
 
 	for {
-		log.Printf("Writing keep-alive to %s", c.peer.String())
+		time.Sleep(time.Second * 60)
+
+		log.Printf("Writing keep-alive to %s\n", peer.String())
 		_, err := conn.Write(keepAliveMsg[:])
 
 		if err != nil {
-			log.Println("Cannot write keep-alive, disconnecting...")
+			log.Printf("Cannot write keep-alive to %s, disconnecting...\n", peer.String())
 			_ = conn.Close()
 
 			return
 		}
-
-		time.Sleep(time.Second * 1)
 	}
+}
+
+func (c *WireProtocolConnection) generateHandshakeMsg() []byte {
+	// <pstrlen><pstr><reserved><info_hash><peer_id>
+
+	var zeroes = [8]byte{}
+
+	buf := bytes.NewBuffer(make([]byte, 0, 68))
+	_ = binary.Write(buf, binary.BigEndian, int8(len(protocolVersionConstant)))
+	buf.WriteString(protocolVersionConstant)
+	buf.Write(zeroes[:])
+	buf.Write(c.infoHash)
+	buf.Write([]byte(c.ownId))
+
+	return buf.Bytes()
 }
 
 func (tc *TorrentClient) recalculateStats() {
@@ -476,11 +532,14 @@ func createTorrentInfo(untyped interface{}) TorrentMetadata {
 		topLevelName = ""
 	}
 
+	pieceLen := info["piece length"].(int)
+
 	return TorrentMetadata{
 		announceUrls: announces,
 		infoHash:     infoHash[:],
 		folder:       topLevelName,
 		files:        files,
 		raw:          dict,
+		pieceLen:     pieceLen,
 	}
 }
