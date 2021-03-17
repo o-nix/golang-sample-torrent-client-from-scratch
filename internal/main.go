@@ -98,7 +98,15 @@ type Peer struct {
 }
 
 func (p *Peer) String() string {
-	return fmt.Sprintf("[%s %s:%d]", p.ID, p.IP.String(), p.Port)
+	var fmtString string
+
+	if p.ID != "" {
+		fmtString = "{Peer id:%s, h:%s, p:%d}"
+	} else {
+		fmtString = "{Peer h:%s, p:%d}"
+	}
+
+	return fmt.Sprintf(fmtString, p.ID, p.IP.String(), p.Port)
 }
 
 func (p *Peer) ToBytes() []byte {
@@ -117,7 +125,7 @@ type UpDownStats struct {
 
 type TorrentMetadata struct {
 	announceUrls []string
-	infoHash     []byte
+	infoHash     SHA1Hash
 	files        []FileInfo
 	raw          map[string]interface{}
 	folder       string
@@ -189,10 +197,13 @@ func (tc *TorrentClient) run() {
 type WireProtocolConnection struct {
 	peer      Peer
 	active    bool
-	infoHash  []byte
+	infoHash  SHA1Hash
 	ownID     string
 	pieceSize int
 	conn      *messageConnection
+
+	readCh  chan WireMessage
+	writeCh chan WireMessage
 
 	iamChoked       bool // Default: true
 	iamInteresting  bool // Default: false
@@ -200,9 +211,10 @@ type WireProtocolConnection struct {
 	peerInteresting bool // Default: false
 }
 
+const handshakeSizeBytes = 68
+
 const (
 	keepAliveKind = 0xFF
-	handshakeKind = keepAliveKind - iota
 )
 
 const (
@@ -249,12 +261,18 @@ func (w wireMessage) Bytes() []byte {
 }
 
 func (w wireMessage) String() string {
-	return fmt.Sprintf("[Message type %d]", w.kind)
+	return fmt.Sprintf("{Wire message t:%d, s:%d}", w.kind, len(w.payload))
+}
+
+type SHA1Hash []byte
+
+func (s SHA1Hash) String() string {
+	return hex.EncodeToString(s)
 }
 
 type handshakeMessage struct {
 	peerID   string
-	infoHash []byte
+	infoHash SHA1Hash
 }
 
 // <pstrlen><pstr><reserved><info_hash><peer_id>
@@ -262,7 +280,7 @@ func (h handshakeMessage) Bytes() []byte {
 	const protocolVersionConstant = "BitTorrent protocol"
 	var zeroes = [8]byte{}
 
-	buf := bytes.NewBuffer(make([]byte, 0, 68))
+	buf := bytes.NewBuffer(make([]byte, 0, handshakeSizeBytes))
 	_ = binary.Write(buf, binary.BigEndian, int8(len(protocolVersionConstant)))
 	buf.WriteString(protocolVersionConstant)
 	buf.Write(zeroes[:])
@@ -273,7 +291,7 @@ func (h handshakeMessage) Bytes() []byte {
 }
 
 func (h handshakeMessage) String() string {
-	return fmt.Sprintf("[Message type handshake]")
+	return fmt.Sprintf("{Handshake message id:%s, h:%s}", h.peerID, h.infoHash.String())
 }
 
 func parseHandshake(handshake []byte) handshakeMessage {
@@ -295,151 +313,81 @@ func (c *messageConnection) writeMsg(msg WireMessage) (int, error) {
 	return c.Write(msg.Bytes())
 }
 
+func (c *WireProtocolConnection) close() {
+	_ = c.conn.Close()
+
+	close(c.readCh)
+	close(c.writeCh)
+
+	c.conn = nil
+	c.active = false
+}
+
 func (c *WireProtocolConnection) start() {
-	peer := c.peer
-	host := net.JoinHostPort(peer.IP.String(), strconv.Itoa(peer.Port))
+	host := net.JoinHostPort(c.peer.IP.String(), strconv.Itoa(c.peer.Port))
 	conn, err := net.Dial("tcp", host)
 
 	if err != nil {
 		c.active = false
-		log.Println("Cannot initiate connect to", peer)
+		log.Printf("Cannot initiate connect to %s\n", c.peer.String())
 
 		return
 	}
 
 	c.conn = &messageConnection{conn}
 
-	readCh := make(chan WireMessage)
-	writeCh := make(chan WireMessage)
+	c.readCh = make(chan WireMessage)
+	c.writeCh = make(chan WireMessage)
 
-	go func() {
-		const readBufSize = 1024
-		readBuf := make([]byte, readBufSize, readBufSize)
-		msgBuf := bytes.NewBuffer(nil)
-		var numWantMore uint32
-		shaked := false
-		handshake := make([]byte, 68, 68)
-
-		for {
-			_ = conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
-			numRead, err := conn.Read(readBuf)
-
-			reader := bytes.NewReader(readBuf[:numRead])
-			_, _ = msgBuf.ReadFrom(reader)
-
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
-			} else if err != nil {
-				log.Println("Disconnected from", peer)
-				return
-			}
-
-			if !shaked {
-				if msgBuf.Len() < 68 { // Fewer than handshake
-					continue
-				}
-
-				_, _ = msgBuf.Read(handshake)
-				shaked = true
-
-				handshakeMsg := parseHandshake(handshake)
-				peer.ID = handshakeMsg.peerID
-
-				if !bytes.Equal(handshakeMsg.infoHash, c.infoHash) {
-					log.Printf("Peer returned wrong info_hash %s, disconnecting...\n", hex.EncodeToString(handshakeMsg.infoHash))
-
-					_ = conn.Close()
-
-					return
-				}
-
-				log.Println("Got handshake from", peer)
-
-				readCh <- handshakeMsg
-			}
-
-			for {
-				if numWantMore == 0 { // Read first 4 bytes containing msg size
-					if msgBuf.Len() < 4 {
-						break
-					}
-
-					_ = binary.Read(msgBuf, binary.BigEndian, &numWantMore)
-				}
-
-				if uint32(msgBuf.Len()) < numWantMore { // Message is still incomplete, wait for new network bytes
-					if msgBuf.Cap() > 32*1024 {
-						msgBuf.Truncate(1024) // Do we need this?
-					}
-
-					break
-				}
-
-				kind, _ := msgBuf.ReadByte() // 5th bytes is the msg type
-				numWantMore--                // Type byte is included in the size
-				payload := make([]byte, numWantMore)
-
-				_, _ = msgBuf.Read(payload)
-				numWantMore = 0
-
-				msg := wireMessage{
-					kind:    kind,
-					payload: payload,
-				}
-
-				readCh <- msg
-
-				log.Printf("New message %d received from %s\n", kind, peer.String())
-			}
-		}
-	}()
-
-	go func() {
-		for msg := range writeCh {
-			log.Printf("Sending message %s to %s\n", msg.String(), peer.String())
-			_, err = c.conn.writeMsg(msg)
-
-			if err != nil {
-				log.Printf("Unable to send message to %s, disconnecting...\n", peer.String())
-
-				_ = c.conn.Close()
-				c.conn = nil
-
-				return
-			}
-		}
-	}()
-
-	log.Println("Sending handshake to", peer)
+	go startReading(c)
+	go startWriting(c)
 
 	startHandshake := handshakeMessage{
 		peerID:   c.ownID,
 		infoHash: c.infoHash,
 	}
 
-	writeCh <- startHandshake
+	log.Printf("Sending handshake %s to %s", startHandshake.String(), c.peer.String())
+
+	c.writeCh <- startHandshake
 
 	select {
-	case handshakeMsg := <-readCh:
-		log.Println("Successful handshake", handshakeMsg)
+	case msg := <-c.readCh:
+		handshakeMsg, ok := msg.(handshakeMessage)
+
+		if !ok {
+			log.Printf("Peer %s started messaging not with a handshake, disconnecting...\n", c.peer.String())
+			return
+		}
+
+		if !bytes.Equal(handshakeMsg.infoHash, c.infoHash) {
+			log.Printf("Peer returned wrong info_hash %s, should be %s, disconnecting...\n",
+				handshakeMsg.infoHash.String(), c.infoHash.String())
+
+			return
+		}
+
+		c.peer.ID = handshakeMsg.peerID
+
+		log.Printf("Successful handshake %s with %s\n", handshakeMsg.String(), c.peer.String())
 	case <-time.After(time.Second * 10):
 		panic("Unable to get handshake")
 	}
 
-	writeCh <- keepAliveMsg
-
-	keepAliveTicker := time.Tick(time.Second * 10)
+	keepAliveTicker := time.Tick(time.Second * 60)
 
 	for {
 		select {
-		case msg, ok := <-readCh:
+		case msg, ok := <-c.readCh:
 			if !ok {
-				panic("Disconnected")
+				log.Printf("Peer %s disconnected\n", c.peer.String())
+				return
 			}
 
-			log.Println(msg)
+			log.Printf("New %s from %s\n", msg.String(), c.peer.String())
+
 		case <-keepAliveTicker:
-			writeCh <- keepAliveMsg
+			c.writeCh <- keepAliveMsg
 		}
 	}
 
@@ -451,6 +399,111 @@ func (c *WireProtocolConnection) start() {
 	// request = append(request, tt[:]...)
 	//
 	// _, err = conn.Write(request)
+}
+
+func startReading(c *WireProtocolConnection) {
+	defer func() {
+		c.close()
+	}()
+
+	const readBufSize = 1024
+	var numWantMore uint32
+
+	shaked := false
+
+	readBuf := make([]byte, readBufSize, readBufSize)
+	msgBuf := bytes.NewBuffer(nil)
+	handshake := make([]byte, handshakeSizeBytes, handshakeSizeBytes)
+	maxPossiblePayloadSize := c.pieceSize + 5
+
+	for {
+		_ = c.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
+		numRead, err := c.conn.Read(readBuf)
+
+		reader := bytes.NewReader(readBuf[:numRead])
+		_, _ = msgBuf.ReadFrom(reader)
+
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			continue
+		} else if err != nil { // TCP connection closed
+			return
+		}
+
+		if !shaked {
+			if msgBuf.Len() < handshakeSizeBytes { // Fewer than handshake
+				continue
+			}
+
+			_, _ = msgBuf.Read(handshake)
+			shaked = true
+
+			handshakeMsg := parseHandshake(handshake)
+			c.readCh <- handshakeMsg
+		}
+
+		for {
+			if numWantMore == 0 { // Read first 4 bytes containing msg size
+				if msgBuf.Len() < 4 {
+					break
+				}
+
+				_ = binary.Read(msgBuf, binary.BigEndian, &numWantMore)
+			}
+
+			if uint32(msgBuf.Len()) < numWantMore { // Message is still incomplete, wait for new network bytes
+				if msgBuf.Cap() > 32*1024 {
+					msgBuf.Truncate(1024) // Do we need this?
+				}
+
+				break
+			}
+
+			var kind byte = keepAliveKind
+
+			if numWantMore > 0 { // Not just keep-alive message
+				kind, _ = msgBuf.ReadByte() // 5th bytes is the msg type
+				numWantMore--               // Type byte is included in the size
+			}
+
+			// Check that no more than N bytes requested, we don't want to crash on 4GB allocations
+			if numWantMore > uint32(maxPossiblePayloadSize) {
+				log.Fatalf("Payload size requested %d is too big (max %d)\n", numWantMore, maxPossiblePayloadSize)
+
+				return
+			}
+
+			payload := make([]byte, int(numWantMore))
+
+			_, _ = msgBuf.Read(payload)
+			numWantMore = 0
+
+			msg := wireMessage{
+				kind:    kind,
+				payload: payload,
+			}
+
+			c.readCh <- msg
+		}
+	}
+}
+
+func startWriting(c *WireProtocolConnection) {
+	func(c *WireProtocolConnection) {
+		defer func() {
+			c.close()
+		}()
+
+		for msg := range c.writeCh {
+			log.Printf("Sending %s to %s\n", msg.String(), c.peer.String())
+			_, err := c.conn.writeMsg(msg)
+
+			if err != nil {
+				log.Printf("Unable to send message to %s, disconnecting...\n", c.peer.String())
+
+				return
+			}
+		}
+	}(c)
 }
 
 func (tc *TorrentClient) recalculateStats() {
