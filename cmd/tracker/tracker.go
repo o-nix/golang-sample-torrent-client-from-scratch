@@ -45,7 +45,7 @@ func main() {
 		if _, present := hashes[hash][key]; !present {
 			hashes[hash][key] = PeerInfo{
 				details: internal.Peer{
-					Ip:   ip,
+					IP:   ip,
 					Port: port,
 				},
 				stats: internal.UpDownStats{},

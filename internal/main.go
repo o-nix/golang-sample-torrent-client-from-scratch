@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/o-nix/golang-sample-torrent-client-from-scratch/pkg/bencode"
 	"io"
@@ -69,7 +70,7 @@ func Start(filePath string) {
 
 		transport := TrackerTransport{
 			active:        true,
-			trackerUrl:    *parsedUrl,
+			trackerURL:    *parsedUrl,
 			localConnInfo: localConnInfo,
 		}
 
@@ -83,7 +84,7 @@ func Start(filePath string) {
 
 type TrackerTransport struct {
 	active        bool
-	trackerUrl    url.URL
+	trackerURL    url.URL
 	localConnInfo LocalConnectionInfo
 	peerID        string
 	trackerID     string
@@ -91,19 +92,19 @@ type TrackerTransport struct {
 }
 
 type Peer struct {
-	Id   string
-	Ip   net.IP
+	ID   string
+	IP   net.IP
 	Port int
 }
 
 func (p *Peer) String() string {
-	return fmt.Sprintf("[%s %s:%d]", p.Id, p.Ip.String(), p.Port)
+	return fmt.Sprintf("[%s %s:%d]", p.ID, p.IP.String(), p.Port)
 }
 
 func (p *Peer) ToBytes() []byte {
 	result := make([]byte, 6)
 	binary.BigEndian.PutUint16(result[4:], uint16(p.Port))
-	copy(result, p.Ip.To4())
+	copy(result, p.IP.To4())
 
 	return result
 }
@@ -148,7 +149,7 @@ func (tc *TorrentClient) run() {
 		outer:
 			for _, newPeer := range peers {
 				for _, existingPeer := range tc.peers {
-					if newPeer.Ip.Equal(existingPeer.Ip) && newPeer.Port == existingPeer.Port {
+					if newPeer.IP.Equal(existingPeer.IP) && newPeer.Port == existingPeer.Port {
 						continue outer
 					}
 				}
@@ -163,7 +164,7 @@ func (tc *TorrentClient) run() {
 			peer:      peer,
 			active:    true,
 			infoHash:  tc.metadata.infoHash,
-			ownId:     tc.peerID,
+			ownID:     tc.peerID,
 			pieceSize: tc.metadata.pieceLen,
 
 			iamChoked:       true,
@@ -189,9 +190,9 @@ type WireProtocolConnection struct {
 	peer      Peer
 	active    bool
 	infoHash  []byte
-	ownId     string
+	ownID     string
 	pieceSize int
-	conn      net.Conn
+	conn      *messageConnection
 
 	iamChoked       bool // Default: true
 	iamInteresting  bool // Default: false
@@ -200,34 +201,103 @@ type WireProtocolConnection struct {
 }
 
 const (
-	choke         = iota
-	unchoke       = iota
-	interested    = iota
-	notInterested = iota
-	have          = iota
-	bitfield      = iota
-	request       = iota
+	keepAliveKind = 0xFF
+	handshakeKind = keepAliveKind - iota
 )
 
-const protocolVersionConstant = "BitTorrent protocol"
+const (
+	chokeKind         = iota
+	unchokeKind       = iota
+	interestedKind    = iota
+	notInterestedKind = iota
+	haveKind          = iota
+	bitfieldKind      = iota
+	requestKind       = iota
+)
 
-var keepAliveMsg = [4]byte{}
+type WireMessage interface {
+	Bytes() []byte
+	String() string
+}
 
-var unchokeMsg = createMsg(unchoke, 1)
-var interestedMsg = createMsg(interested, 1)
+type wireMessage struct {
+	kind    byte
+	payload []byte
+	cached  []byte
+}
 
-func createMsg(msg byte, len uint32) []byte {
-	var buf = bytes.NewBuffer(nil)
+func (w wireMessage) Bytes() []byte {
+	if w.cached == nil {
+		size := len(w.payload)
 
-	_ = binary.Write(buf, binary.BigEndian, len)
-	_ = binary.Write(buf, binary.BigEndian, msg)
+		if w.kind != keepAliveKind {
+			size++
+		}
+
+		buf := bytes.NewBuffer(make([]byte, 0, size))
+		_ = binary.Write(buf, binary.BigEndian, size)
+
+		if w.kind != keepAliveKind {
+			_ = binary.Write(buf, binary.BigEndian, w.kind)
+		}
+
+		buf.Write(w.payload)
+		w.cached = buf.Bytes()
+	}
+
+	return w.cached
+}
+
+func (w wireMessage) String() string {
+	return fmt.Sprintf("[Message type %d]", w.kind)
+}
+
+type handshakeMessage struct {
+	peerID   string
+	infoHash []byte
+}
+
+// <pstrlen><pstr><reserved><info_hash><peer_id>
+func (h handshakeMessage) Bytes() []byte {
+	const protocolVersionConstant = "BitTorrent protocol"
+	var zeroes = [8]byte{}
+
+	buf := bytes.NewBuffer(make([]byte, 0, 68))
+	_ = binary.Write(buf, binary.BigEndian, int8(len(protocolVersionConstant)))
+	buf.WriteString(protocolVersionConstant)
+	buf.Write(zeroes[:])
+	buf.Write(h.infoHash)
+	buf.Write([]byte(h.peerID))
 
 	return buf.Bytes()
 }
 
+func (h handshakeMessage) String() string {
+	return fmt.Sprintf("[Message type handshake]")
+}
+
+func parseHandshake(handshake []byte) handshakeMessage {
+	return handshakeMessage{
+		peerID:   string(handshake[48:]),
+		infoHash: handshake[28:48],
+	}
+}
+
+var keepAliveMsg = wireMessage{kind: keepAliveKind}
+var unchokeMsg = wireMessage{kind: unchokeKind}
+var interestedMsg = wireMessage{kind: interestedKind}
+
+type messageConnection struct {
+	net.Conn
+}
+
+func (c *messageConnection) writeMsg(msg WireMessage) (int, error) {
+	return c.Write(msg.Bytes())
+}
+
 func (c *WireProtocolConnection) start() {
 	peer := c.peer
-	host := net.JoinHostPort(peer.Ip.String(), strconv.Itoa(peer.Port))
+	host := net.JoinHostPort(peer.IP.String(), strconv.Itoa(peer.Port))
 	conn, err := net.Dial("tcp", host)
 
 	if err != nil {
@@ -237,57 +307,55 @@ func (c *WireProtocolConnection) start() {
 		return
 	}
 
-	c.conn = conn
+	c.conn = &messageConnection{conn}
 
-	log.Println("Sending handshake to", peer)
-	_, err = conn.Write(c.generateHandshakeMsg())
-
-	if err != nil {
-		log.Println("Unable to connect and send handshake to", peer)
-		c.conn = nil
-
-		return
-	}
+	readCh := make(chan WireMessage)
+	writeCh := make(chan WireMessage)
 
 	go func() {
-		readBuf := make([]byte, 1, 1)
+		const readBufSize = 1024
+		readBuf := make([]byte, readBufSize, readBufSize)
 		msgBuf := bytes.NewBuffer(nil)
 		var numWantMore uint32
 		shaked := false
 		handshake := make([]byte, 68, 68)
 
 		for {
+			_ = conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
 			numRead, err := conn.Read(readBuf)
-
-			if err != nil {
-				log.Println("Disconnected from", peer)
-				return
-			}
 
 			reader := bytes.NewReader(readBuf[:numRead])
 			_, _ = msgBuf.ReadFrom(reader)
 
-			if !shaked && msgBuf.Len() < 68 { // Fewer than "message size" bytes
+			if errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
+			} else if err != nil {
+				log.Println("Disconnected from", peer)
+				return
 			}
 
 			if !shaked {
+				if msgBuf.Len() < 68 { // Fewer than handshake
+					continue
+				}
+
 				_, _ = msgBuf.Read(handshake)
 				shaked = true
 
-				peerInfoHash := handshake[28:48]
+				handshakeMsg := parseHandshake(handshake)
+				peer.ID = handshakeMsg.peerID
 
-				if !bytes.Equal(peerInfoHash, c.infoHash) {
-					log.Printf("Peer returned info_hash %s we are not interested in, disconnecting...\n", hex.EncodeToString(peerInfoHash))
+				if !bytes.Equal(handshakeMsg.infoHash, c.infoHash) {
+					log.Printf("Peer returned wrong info_hash %s, disconnecting...\n", hex.EncodeToString(handshakeMsg.infoHash))
 
 					_ = conn.Close()
 
 					return
 				}
 
-				peer.Id = string(handshake[48:])
-
 				log.Println("Got handshake from", peer)
+
+				readCh <- handshakeMsg
 			}
 
 			for {
@@ -307,27 +375,73 @@ func (c *WireProtocolConnection) start() {
 					break
 				}
 
-				msgType, _ := msgBuf.ReadByte() // 5th bytes is the msg type
-				numWantMore--                   // Type byte is included in the size
+				kind, _ := msgBuf.ReadByte() // 5th bytes is the msg type
+				numWantMore--                // Type byte is included in the size
 				payload := make([]byte, numWantMore)
 
 				_, _ = msgBuf.Read(payload)
 				numWantMore = 0
 
-				log.Printf("New message %d received from %s\n", msgType, peer.String())
+				msg := wireMessage{
+					kind:    kind,
+					payload: payload,
+				}
+
+				readCh <- msg
+
+				log.Printf("New message %d received from %s\n", kind, peer.String())
 			}
 		}
 	}()
 
-	time.Sleep(time.Second * 2)
+	go func() {
+		for msg := range writeCh {
+			log.Printf("Sending message %s to %s\n", msg.String(), peer.String())
+			_, err = c.conn.writeMsg(msg)
 
-	log.Printf("Sending initial keep-alive to %s\n", peer.String())
-	_, err = conn.Write(keepAliveMsg[:])
+			if err != nil {
+				log.Printf("Unable to send message to %s, disconnecting...\n", peer.String())
 
-	// time.Sleep(time.Second * 2)
+				_ = c.conn.Close()
+				c.conn = nil
 
-	// log.Println("Sending initial INTERESTED to", peer)
-	// _, err = conn.Write(interestedMsg[:])
+				return
+			}
+		}
+	}()
+
+	log.Println("Sending handshake to", peer)
+
+	startHandshake := handshakeMessage{
+		peerID:   c.ownID,
+		infoHash: c.infoHash,
+	}
+
+	writeCh <- startHandshake
+
+	select {
+	case handshakeMsg := <-readCh:
+		log.Println("Successful handshake", handshakeMsg)
+	case <-time.After(time.Second * 10):
+		panic("Unable to get handshake")
+	}
+
+	writeCh <- keepAliveMsg
+
+	keepAliveTicker := time.Tick(time.Second * 10)
+
+	for {
+		select {
+		case msg, ok := <-readCh:
+			if !ok {
+				panic("Disconnected")
+			}
+
+			log.Println(msg)
+		case <-keepAliveTicker:
+			writeCh <- keepAliveMsg
+		}
+	}
 
 	// request := createMsg(request, 13)
 	// zero := [4]byte{0}
@@ -337,35 +451,6 @@ func (c *WireProtocolConnection) start() {
 	// request = append(request, tt[:]...)
 	//
 	// _, err = conn.Write(request)
-
-	for {
-		time.Sleep(time.Second * 60)
-
-		log.Printf("Writing keep-alive to %s\n", peer.String())
-		_, err := conn.Write(keepAliveMsg[:])
-
-		if err != nil {
-			log.Printf("Cannot write keep-alive to %s, disconnecting...\n", peer.String())
-			_ = conn.Close()
-
-			return
-		}
-	}
-}
-
-func (c *WireProtocolConnection) generateHandshakeMsg() []byte {
-	// <pstrlen><pstr><reserved><info_hash><peer_id>
-
-	var zeroes = [8]byte{}
-
-	buf := bytes.NewBuffer(make([]byte, 0, 68))
-	_ = binary.Write(buf, binary.BigEndian, int8(len(protocolVersionConstant)))
-	buf.WriteString(protocolVersionConstant)
-	buf.Write(zeroes[:])
-	buf.Write(c.infoHash)
-	buf.Write([]byte(c.ownId))
-
-	return buf.Bytes()
 }
 
 func (tc *TorrentClient) recalculateStats() {
@@ -389,7 +474,7 @@ type LocalConnectionInfo struct {
 }
 
 func (tt *TrackerTransport) announce(event string, infoHash []byte, stats UpDownStats) (peers []Peer, err error) {
-	trackerUrl := tt.trackerUrl
+	trackerUrl := tt.trackerURL
 	localConnInfo := tt.localConnInfo
 	query := trackerUrl.Query()
 
@@ -447,8 +532,8 @@ func (tt *TrackerTransport) announce(event string, infoHash []byte, stats UpDown
 	return peers, nil
 }
 
-func decodePeers(IPsString string) (peers []Peer) {
-	reader := bytes.NewReader([]byte(IPsString))
+func decodePeers(ipsString string) (peers []Peer) {
+	reader := bytes.NewReader([]byte(ipsString))
 	chunk := make([]byte, 6)
 	peers = make([]Peer, 0, reader.Size()/6)
 
@@ -460,7 +545,7 @@ func decodePeers(IPsString string) (peers []Peer) {
 		}
 
 		peer := Peer{}
-		peer.Ip = chunk[:4]
+		peer.IP = chunk[:4]
 		peer.Port = int(binary.BigEndian.Uint16(chunk[4:]))
 
 		peers = append(peers, peer)
