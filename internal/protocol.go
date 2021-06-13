@@ -42,11 +42,11 @@ type messageConnection struct {
 	net.Conn
 }
 
-func (c *messageConnection) WriteMsg(msg WireMessage) (int, error) {
+func (c *messageConnection) writeMsg(msg WireMessage) (int, error) {
 	return c.Write(msg.Bytes())
 }
 
-func (c *wireProtocolConnection) Close() {
+func (c *wireProtocolConnection) close() {
 	c.signalSubscribers(connectionClosedMsg)
 
 	if c.conn != nil {
@@ -67,7 +67,7 @@ func (c *wireProtocolConnection) Close() {
 	c.active = false
 }
 
-func (c *wireProtocolConnection) Message(message WireMessage) {
+func (c *wireProtocolConnection) message(message WireMessage) {
 	if c.active {
 		select {
 		case c.writeCh <- message:
@@ -77,7 +77,7 @@ func (c *wireProtocolConnection) Message(message WireMessage) {
 	}
 }
 
-func (c *wireProtocolConnection) Subscribe(kind byte, once bool) chan WireMessage {
+func (c *wireProtocolConnection) subscribe(kind byte, once bool) chan WireMessage {
 	ch := make(chan WireMessage, 1)
 
 	if kind == handshakeKind && c.active {
@@ -101,7 +101,7 @@ func (c *wireProtocolConnection) Subscribe(kind byte, once bool) chan WireMessag
 	return ch
 }
 
-func (c *wireProtocolConnection) Unsubscribe(ch chan WireMessage) {
+func (c *wireProtocolConnection) unsubscribe(ch chan WireMessage) {
 	c.subscribeMutex.Lock()
 
 	for i, subscriber := range c.subscribers {
@@ -115,11 +115,11 @@ func (c *wireProtocolConnection) Unsubscribe(ch chan WireMessage) {
 	c.subscribeMutex.Unlock()
 }
 
-func (c *wireProtocolConnection) Start() {
-	c.Close()
+func (c *wireProtocolConnection) start() {
+	c.close()
 
 	defer func() {
-		_ = c.Close
+		_ = c.close
 	}()
 
 	host := net.JoinHostPort(c.peer.IP.String(), strconv.Itoa(c.peer.Port))
@@ -155,7 +155,7 @@ func (c *wireProtocolConnection) Start() {
 
 		if !ok {
 			log.Printf("Peer %s started messaging not with a handshake, disconnecting...\n", c.peer.String())
-			c.Close()
+			c.close()
 
 			return
 		}
@@ -163,7 +163,7 @@ func (c *wireProtocolConnection) Start() {
 		if !bytes.Equal(handshakeMsg.infoHash, c.infoHash) {
 			log.Printf("Peer returned wrong info_hash %s, should be %s, disconnecting...\n",
 				handshakeMsg.infoHash.String(), c.infoHash.String())
-			c.Close()
+			c.close()
 
 			return
 		}
@@ -202,7 +202,7 @@ func (c *wireProtocolConnection) Start() {
 			c.signalSubscribers(msg)
 
 		case <-keepAliveTicker:
-			c.Message(keepAliveMsg)
+			c.message(keepAliveMsg)
 		}
 	}
 }
@@ -218,14 +218,14 @@ func (c *wireProtocolConnection) signalSubscribers(msg WireMessage) {
 		}
 
 		if subscriber.once {
-			c.Unsubscribe(subscriber.ch)
+			c.unsubscribe(subscriber.ch)
 		}
 	}
 }
 
 func (c *wireProtocolConnection) startReading() {
 	defer func() {
-		c.Close()
+		c.close()
 	}()
 
 	var numWantMore uint32
@@ -310,12 +310,12 @@ func (c *wireProtocolConnection) startReading() {
 
 func (c *wireProtocolConnection) startWriting() {
 	defer func() {
-		c.Close()
+		c.close()
 	}()
 
 	for msg := range c.writeCh {
 		log.Printf("Sending %s to %s\n", msg.String(), c.peer.String())
-		_, err := c.conn.WriteMsg(msg)
+		_, err := c.conn.writeMsg(msg)
 		log.Printf("Message sent")
 
 		if err != nil {

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"net"
 )
 
@@ -80,4 +81,16 @@ func Pow(n int, m int) int {
 	}
 
 	return result
+}
+
+func randomLetters(n int) string {
+	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+	buf := make([]rune, n)
+
+	for i := range buf {
+		buf[i] = letters[rand.Intn(len(letters))]
+	}
+
+	return string(buf)
 }

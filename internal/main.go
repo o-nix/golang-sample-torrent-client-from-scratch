@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"github.com/dchest/uniuri"
 	"github.com/o-nix/golang-sample-torrent-client-from-scratch/pkg/bencode"
 	"log"
 	"net/http"
@@ -40,7 +39,6 @@ func Start(filePath string) {
 		metadata: metadata,
 		peerID:   peerID,
 	}
-
 	for _, announceUrl := range metadata.announceUrls {
 		parsedUrl, err := url.Parse(announceUrl)
 
@@ -58,14 +56,23 @@ func Start(filePath string) {
 		client.trackers = append(client.trackers, transport)
 	}
 
-	go client.run()
+	appSignals := make(chan bool)
+
+	go client.run(localConnInfo, appSignals)
 
 	systemSignals := make(chan os.Signal)
 	signal.Notify(systemSignals, syscall.SIGINT, syscall.SIGTERM)
 
-	select {
-	case <-systemSignals:
+	stop := func() {
 		client.Stop()
+		os.Exit(0)
+	}
+
+	select {
+	case <-appSignals:
+		stop()
+	case <-systemSignals:
+		stop()
 	}
 }
 
@@ -75,5 +82,5 @@ func getPort() int {
 
 // https://wiki.theory.org/BitTorrentSpecification#peer_id
 func generatePeerID() string {
-	return "-DF0001-" + uniuri.NewLen(12)
+	return "-DF0001-" + randomLetters(12)
 }
