@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/o-nix/golang-sample-torrent-client-from-scratch/pkg/bencode"
 	"io"
+	"log"
 	"net/url"
 	"strconv"
 )
@@ -48,6 +49,7 @@ func (tt *TrackerTransport) announce(event string, infoHash []byte, stats UpDown
 
 	trackerUrl.RawQuery = query.Encode()
 
+	log.Printf("Sending %s event to tracker %s\n", event, tt.trackerURL.String())
 	resp, err := httpClient.Get(trackerUrl.String())
 
 	if err != nil {

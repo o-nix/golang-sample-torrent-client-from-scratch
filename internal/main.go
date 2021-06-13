@@ -4,10 +4,11 @@ import (
 	"github.com/dchest/uniuri"
 	"github.com/o-nix/golang-sample-torrent-client-from-scratch/pkg/bencode"
 	"log"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -15,10 +16,9 @@ var httpClient http.Client
 
 func init() {
 	httpClient = http.Client{
+		// Default timeout will prevent HTTP requests from waiting the response forever
 		Timeout: time.Second * 30,
 	}
-
-	rand.Seed(time.Now().UnixNano())
 }
 
 func Start(filePath string) {
@@ -28,7 +28,7 @@ func Start(filePath string) {
 		panic("Error reading torrent file")
 	}
 
-	metadata := createTorrentInfo(bencode.Decode(content))
+	metadata := createTorrentInfo(bencode.Decode(content).(map[string]interface{}))
 	peerID := generatePeerID()
 
 	localConnInfo := LocalConnectionInfo{
@@ -60,11 +60,17 @@ func Start(filePath string) {
 
 	go client.run()
 
-	select {}
+	systemSignals := make(chan os.Signal)
+	signal.Notify(systemSignals, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case <-systemSignals:
+		client.Stop()
+	}
 }
 
 func getPort() int {
-	return 25276 // 16000 + rand.Intn(32000)
+	return testLocalPort // 16000 + rand.Intn(32000)
 }
 
 // https://wiki.theory.org/BitTorrentSpecification#peer_id

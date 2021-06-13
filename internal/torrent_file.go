@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"github.com/o-nix/golang-sample-torrent-client-from-scratch/pkg/bencode"
 	"path/filepath"
@@ -11,13 +12,12 @@ type TorrentMetadata struct {
 	announceUrls []string
 	infoHash     SHA1Hash
 	files        []FileInfo
-	raw          map[string]interface{}
 	folder       string
 	pieceLen     int
+	hashes       []SHA1Hash
 }
 
-func createTorrentInfo(untyped interface{}) TorrentMetadata {
-	dict := untyped.(map[string]interface{})
+func createTorrentInfo(dict map[string]interface{}) *TorrentMetadata {
 	var annListValue []interface{}
 
 	if annListUntyped := dict["announce-list"]; annListUntyped != nil {
@@ -75,13 +75,31 @@ func createTorrentInfo(untyped interface{}) TorrentMetadata {
 	}
 
 	pieceLen := info["piece length"].(int)
+	hashes := readPieceHashes(info)
 
-	return TorrentMetadata{
+	return &TorrentMetadata{
 		announceUrls: announces,
 		infoHash:     infoHash[:],
 		folder:       topLevelName,
 		files:        files,
-		raw:          dict,
 		pieceLen:     pieceLen,
+		hashes:       hashes,
 	}
+}
+
+func readPieceHashes(info map[string]interface{}) []SHA1Hash {
+	r := bytes.NewReader([]byte(info["pieces"].(string)))
+	pieceHashes := make([]SHA1Hash, 0, r.Len()/20)
+
+	for {
+		var hash [hashLen]byte
+		read, err := r.Read(hash[:])
+
+		if err != nil || read < hashLen {
+			break
+		}
+
+		pieceHashes = append(pieceHashes, hash[:])
+	}
+	return pieceHashes
 }

@@ -51,3 +51,33 @@ func (p *Peer) ToBytes() []byte {
 
 	return result
 }
+
+func Min(i1 int, i2 int) int {
+	if i1 < i2 {
+		return i1
+	} else {
+		return i2
+	}
+}
+
+func Max(i1 int, i2 int) int {
+	if i1 > i2 {
+		return i1
+	} else {
+		return i2
+	}
+}
+
+func Pow(n int, m int) int {
+	if m == 0 {
+		return 1
+	}
+
+	result := n
+
+	for i := 2; i <= m; i++ {
+		result *= n
+	}
+
+	return result
+}

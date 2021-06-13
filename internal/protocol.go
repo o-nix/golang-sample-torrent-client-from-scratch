@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -22,10 +23,19 @@ type wireProtocolConnection struct {
 	readCh  chan WireMessage
 	writeCh chan WireMessage
 
-	iamChoked       bool // Default: true
-	iamInteresting  bool // Default: false
-	peerChoked      bool // Default: true
-	peerInteresting bool // Default: false
+	subscribers    []subscriberOptions
+	subscribeMutex sync.Mutex
+
+	iamUnchoked     bool
+	iamInteresting  bool
+	peerUnchoked    bool
+	peerInteresting bool
+}
+
+type subscriberOptions struct {
+	once bool
+	kind byte
+	ch   chan WireMessage
 }
 
 type messageConnection struct {
@@ -37,9 +47,21 @@ func (c *messageConnection) WriteMsg(msg WireMessage) (int, error) {
 }
 
 func (c *wireProtocolConnection) Close() {
-	_ = c.conn.Close()
+	c.signalSubscribers(connectionClosedMsg)
 
-	close(c.readCh)
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+
+	if c.readCh != nil {
+		close(c.readCh)
+		c.readCh = nil
+	}
+
+	if c.writeCh != nil {
+		close(c.writeCh)
+		c.writeCh = nil
+	}
 
 	c.conn = nil
 	c.active = false
@@ -49,14 +71,57 @@ func (c *wireProtocolConnection) Message(message WireMessage) {
 	if c.active {
 		select {
 		case c.writeCh <- message:
-			// Successfully read/queued
 		default:
-			// We avoided blocking
+			// Non-blocking send
 		}
 	}
 }
 
+func (c *wireProtocolConnection) Subscribe(kind byte, once bool) chan WireMessage {
+	ch := make(chan WireMessage, 1)
+
+	if kind == handshakeKind && c.active {
+		ch <- handshakeMessage{peerID: c.peer.ID}
+
+		if once {
+			return ch
+		}
+	}
+
+	c.subscribeMutex.Lock()
+
+	c.subscribers = append(c.subscribers, subscriberOptions{
+		once: once,
+		kind: kind,
+		ch:   ch,
+	})
+
+	c.subscribeMutex.Unlock()
+
+	return ch
+}
+
+func (c *wireProtocolConnection) Unsubscribe(ch chan WireMessage) {
+	c.subscribeMutex.Lock()
+
+	for i, subscriber := range c.subscribers {
+		if subscriber.ch == ch {
+			c.subscribers = append(c.subscribers[:i], c.subscribers[i+1:]...)
+		}
+	}
+
+	close(ch)
+
+	c.subscribeMutex.Unlock()
+}
+
 func (c *wireProtocolConnection) Start() {
+	c.Close()
+
+	defer func() {
+		_ = c.Close
+	}()
+
 	host := net.JoinHostPort(c.peer.IP.String(), strconv.Itoa(c.peer.Port))
 	conn, err := net.Dial("tcp", host)
 
@@ -90,12 +155,15 @@ func (c *wireProtocolConnection) Start() {
 
 		if !ok {
 			log.Printf("Peer %s started messaging not with a handshake, disconnecting...\n", c.peer.String())
+			c.Close()
+
 			return
 		}
 
 		if !bytes.Equal(handshakeMsg.infoHash, c.infoHash) {
 			log.Printf("Peer returned wrong info_hash %s, should be %s, disconnecting...\n",
 				handshakeMsg.infoHash.String(), c.infoHash.String())
+			c.Close()
 
 			return
 		}
@@ -105,12 +173,14 @@ func (c *wireProtocolConnection) Start() {
 
 		log.Printf("Successful handshake %s with %s\n", handshakeMsg.String(), c.peer.String())
 
-	case <-time.After(time.Second * 10):
-		log.Printf("Unable to get handshake after 10 seconds with %s\n", c.peer.String())
+		c.signalSubscribers(handshakeMsg)
+
+	case <-time.After(handshakeTimeout):
+		log.Printf("Unable to get handshake after %d seconds with %s, disconnecting...\n", handshakeTimeout, c.peer.String())
 		return
 	}
 
-	keepAliveTicker := time.Tick(time.Second * 60)
+	keepAliveTicker := time.Tick(keepAliveTick)
 
 	for {
 		select {
@@ -122,8 +192,33 @@ func (c *wireProtocolConnection) Start() {
 
 			log.Printf("New %s from %s\n", msg.String(), c.peer.String())
 
+			switch msg.Kind() {
+			case unchokeKind:
+				c.iamUnchoked = true
+			case chokeKind:
+				c.iamUnchoked = false
+			}
+
+			c.signalSubscribers(msg)
+
 		case <-keepAliveTicker:
-			c.writeCh <- keepAliveMsg
+			c.Message(keepAliveMsg)
+		}
+	}
+}
+
+func (c *wireProtocolConnection) signalSubscribers(msg WireMessage) {
+	for _, subscriber := range c.subscribers {
+		if kind := subscriber.kind; kind == allMessagesKind || kind == msg.Kind() {
+			select {
+			case subscriber.ch <- msg:
+			default:
+				// Non-blocking write
+			}
+		}
+
+		if subscriber.once {
+			c.Unsubscribe(subscriber.ch)
 		}
 	}
 }
@@ -168,8 +263,8 @@ func (c *wireProtocolConnection) startReading() {
 		}
 
 		for {
-			if numWantMore == 0 { // Read first 4 bytes containing msg size
-				if msgBuf.Len() < 4 {
+			if numWantMore == 0 { // Read first bytes containing msg size
+				if msgBuf.Len() < lenHeaderSizeBytes {
 					break
 				}
 
@@ -191,7 +286,7 @@ func (c *wireProtocolConnection) startReading() {
 				numWantMore--               // Type byte is included in the size
 			}
 
-			// Check that no more than N bytes requested, we don't want to crash on 4GB allocations
+			// Check that no more than N bytes requested, we don't want to crash on 4 GB allocations
 			if numWantMore > uint32(maxPossiblePayloadSize) {
 				log.Fatalf("Payload size requested %d is too big (max %d)\n", numWantMore, maxPossiblePayloadSize)
 
@@ -214,20 +309,19 @@ func (c *wireProtocolConnection) startReading() {
 }
 
 func (c *wireProtocolConnection) startWriting() {
-	func(c *wireProtocolConnection) {
-		defer func() {
-			c.Close()
-		}()
+	defer func() {
+		c.Close()
+	}()
 
-		for msg := range c.writeCh {
-			log.Printf("Sending %s to %s\n", msg.String(), c.peer.String())
-			_, err := c.conn.WriteMsg(msg)
+	for msg := range c.writeCh {
+		log.Printf("Sending %s to %s\n", msg.String(), c.peer.String())
+		_, err := c.conn.WriteMsg(msg)
+		log.Printf("Message sent")
 
-			if err != nil {
-				log.Printf("Unable to send message to %s, disconnecting...\n", c.peer.String())
+		if err != nil {
+			log.Printf("Unable to send message to %s, disconnecting...\n", c.peer.String())
 
-				return
-			}
+			return
 		}
-	}(c)
+	}
 }
