@@ -22,7 +22,6 @@ This is a console app for downloading torrent-hosted content via ***.torrent** f
 ## Usage
 
 ```
-Usage:
 ./golang-sample-torrent-client-from-scratch path/to/file.torrent
 ```
 
