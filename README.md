@@ -16,7 +16,7 @@ This is a console app for downloading torrent-hosted content via ***.torrent** f
 * [ ] Big beautiful progress bar instead of messages log!
 * [ ] Seeding / bitfield / have
 * [ ] Game / randomization mode, it downloads pieces in order
-* [ ] No memory cache flushing (don't)
+* [ ] No memory cache flushing
 * [ ] DHT
 
 ## Usage
