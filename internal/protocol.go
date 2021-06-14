@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -54,12 +55,10 @@ func (c *wireProtocolConnection) close() {
 	}
 
 	if c.readCh != nil {
-		close(c.readCh)
 		c.readCh = nil
 	}
 
 	if c.writeCh != nil {
-		close(c.writeCh)
 		c.writeCh = nil
 	}
 
@@ -123,7 +122,10 @@ func (c *wireProtocolConnection) start() {
 	}()
 
 	host := net.JoinHostPort(c.peer.IP.String(), strconv.Itoa(c.peer.Port))
-	conn, err := net.Dial("tcp", host)
+
+	fmt.Printf("Trying to connect to %s\n", host)
+
+	conn, err := net.DialTimeout("tcp", host, 30*time.Second)
 
 	if err != nil {
 		c.active = false
@@ -131,6 +133,8 @@ func (c *wireProtocolConnection) start() {
 
 		return
 	}
+
+	fmt.Printf("Successfully connected to %s\n", host)
 
 	c.conn = &messageConnection{conn}
 
@@ -316,7 +320,6 @@ func (c *wireProtocolConnection) startWriting() {
 	for msg := range c.writeCh {
 		log.Printf("Sending %s to %s\n", msg.String(), c.peer.String())
 		_, err := c.conn.writeMsg(msg)
-		log.Printf("Message sent")
 
 		if err != nil {
 			log.Printf("Unable to send message to %s, disconnecting...\n", c.peer.String())

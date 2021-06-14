@@ -175,11 +175,15 @@ func (m *piecesManager) onUnchoke(c *wireProtocolConnection) {
 }
 
 func (m *piecesManager) DownloadAll() {
-	tick := time.Tick(100 * time.Millisecond)
+	tick := time.Tick(1 * time.Second)
 	workerDoneSignals := make(chan bool)
-	noMoreWork := make(chan bool, 1)
+	noMoreWork := false
 
 	assignWork := func() {
+		if noMoreWork {
+			return
+		}
+
 		allDownloaded := true
 
 		for _, piece := range m.pieces {
@@ -190,10 +194,7 @@ func (m *piecesManager) DownloadAll() {
 		}
 
 		if allDownloaded {
-			fmt.Println("Download complete! Writing files...")
-			m.writeFiles()
-
-			noMoreWork <- true
+			noMoreWork = true
 			return
 		}
 
@@ -237,7 +238,16 @@ func (m *piecesManager) DownloadAll() {
 			assignWork()
 		case <-tick:
 			assignWork()
-		case <-noMoreWork:
+		}
+
+		if noMoreWork {
+			m.closeAllConnections()
+
+			time.Sleep(5 * time.Second)
+
+			fmt.Println("Download complete! Writing files...")
+			m.writeFiles()
+
 			return
 		}
 	}
@@ -247,6 +257,11 @@ func (m *piecesManager) writeFiles() {
 	// TODO: flush during downloading!
 
 	folderName := m.metadata.folder
+
+	if folderName == "" {
+		folderName = "downloaded_torrent_data"
+	}
+
 	_ = os.RemoveAll(folderName) // TODO: insecure, should check relativeness
 	err := os.Mkdir(folderName, os.ModePerm)
 
@@ -274,6 +289,12 @@ func (m *piecesManager) writeFiles() {
 		}
 
 		start += fileInfo.size
+	}
+}
+
+func (m *piecesManager) closeAllConnections() {
+	for _, detail := range m.downloadDetails {
+		detail.conn.close()
 	}
 }
 

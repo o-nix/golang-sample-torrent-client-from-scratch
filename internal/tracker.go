@@ -82,10 +82,10 @@ func (tt *TrackerTransport) announce(event string, infoHash []byte, stats UpDown
 
 func decodePeers(ipsString string) (peers []Peer) {
 	reader := bytes.NewReader([]byte(ipsString))
-	chunk := make([]byte, 6)
 	peers = make([]Peer, 0, reader.Size()/6)
 
 	for {
+		chunk := make([]byte, 6)
 		numRead, err := reader.Read(chunk)
 
 		if err == io.EOF || numRead < 6 {
