@@ -74,7 +74,7 @@ func (m *piecesManager) onNewConnection(conn *wireProtocolConnection) {
 		select {
 		case <-conn.subscribe(handshakeKind, true):
 		default:
-			return // Closed?
+			return // Closed!
 		}
 
 		unchokeCh := conn.subscribe(unchokeKind, true)

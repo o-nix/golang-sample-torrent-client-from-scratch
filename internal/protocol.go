@@ -70,8 +70,6 @@ func (c *wireProtocolConnection) message(message WireMessage) {
 	if c.active {
 		select {
 		case c.writeCh <- message:
-		default:
-			// Non-blocking send
 		}
 	}
 }
@@ -216,8 +214,6 @@ func (c *wireProtocolConnection) signalSubscribers(msg WireMessage) {
 		if kind := subscriber.kind; kind == allMessagesKind || kind == msg.Kind() {
 			select {
 			case subscriber.ch <- msg:
-			default:
-				// Non-blocking write
 			}
 		}
 
